@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* `no_pii`: added `context_keywords` and `context_mode` (`"extend"` or `"replace"`) to
+  `find_pii()`, `mask_pii()` and `NoPII` for custom SSN, routing number and Aadhaar/VID context
+  keywords, matched case-insensitively with Unicode letter boundaries. Defaults are unchanged.
 * Added tested LangGraph example (`examples/langgraph_agent/graph.py`), optional `[langgraph]`
   extra, integration tests (`tests/test_langgraph.py`), and a dedicated `langgraph` CI job.
 * `no_pii`: added Aadhaar (12-digit, first digit 2-9) and Virtual ID (`aadhaar_vid`, 16-digit)

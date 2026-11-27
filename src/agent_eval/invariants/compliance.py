@@ -143,14 +143,24 @@ _SSN_FORMATTED = re.compile(
 )
 _NINE_DIGITS = re.compile(r"(?<!\d)\d{9}(?!\d)")
 # Letter boundaries instead of \b, so keys such as "routing_number" count.
-_SSN_CONTEXT = re.compile(
-    r"(?<![A-Za-z])(?:ssn|social[\s_]+security|tax[\s_]*id|tin)(?![A-Za-z])", re.IGNORECASE
+_SSN_KEYWORDS = r"ssn|social[\s_]+security|tax[\s_]*id|tin"
+_ROUTING_KEYWORDS = r"routing|aba|rtn"
+_AADHAAR_KEYWORDS = r"aadha?ar|uidai|virtual[\s_]+id|vid"
+_SSN_CONTEXT = re.compile(rf"(?<![A-Za-z])(?:{_SSN_KEYWORDS})(?![A-Za-z])", re.IGNORECASE)
+_ROUTING_CONTEXT = re.compile(
+    rf"(?<![A-Za-z])(?:{_ROUTING_KEYWORDS})(?![A-Za-z])", re.IGNORECASE
 )
-_ROUTING_CONTEXT = re.compile(r"(?<![A-Za-z])(?:routing|aba|rtn)(?![A-Za-z])", re.IGNORECASE)
 _AADHAAR_CONTEXT = re.compile(
-    r"(?<![A-Za-z])(?:aadha?ar|uidai|virtual[\s_]+id|vid)(?![A-Za-z])",
-    re.IGNORECASE,
+    rf"(?<![A-Za-z])(?:{_AADHAAR_KEYWORDS})(?![A-Za-z])", re.IGNORECASE
 )
+_BUILTIN_CONTEXT: dict[str, tuple[str, re.Pattern[str]]] = {
+    "ssn": (_SSN_KEYWORDS, _SSN_CONTEXT),
+    "routing_number": (_ROUTING_KEYWORDS, _ROUTING_CONTEXT),
+    "aadhaar": (_AADHAAR_KEYWORDS, _AADHAAR_CONTEXT),
+}
+ContextMode = Literal["extend", "replace"]
+# "Letter" in any script: a word character that is not a digit or an underscore.
+_UNICODE_LETTER = r"[^\W\d_]"
 _AADHAAR_CANDIDATE = re.compile(
     r"(?<!\d)(?:"
     r"(?P<vid>\d{16}|\d{4}(?P<vs>[- ])\d{4}(?P=vs)\d{4}(?P=vs)\d{4})"
@@ -236,6 +246,43 @@ def verhoeff_valid(number: str) -> bool:
     return checksum == 0
 
 
+def _custom_keyword_pattern(keyword: str) -> str:
+    words = keyword.split()
+    if not words:
+        raise ValueError("context keywords must not be empty")
+    return r"[\s_]+".join(re.escape(word) for word in words)
+
+
+def _context_patterns(
+    context_keywords: Mapping[str, Iterable[str]] | None, mode: ContextMode
+) -> dict[str, re.Pattern[str]]:
+    """Return the context pattern for each gated kind, with custom keywords applied.
+
+    Custom keywords match case-insensitively with Unicode letter boundaries, so
+    keywords in any script work and ``_`` or digits still count as boundaries.
+    """
+    if mode not in ("extend", "replace"):
+        raise ValueError(f"context_mode must be 'extend' or 'replace', got {mode!r}")
+    patterns = {kind: pattern for kind, (_, pattern) in _BUILTIN_CONTEXT.items()}
+    if not context_keywords:
+        return patterns
+    for kind, keywords in context_keywords.items():
+        if kind not in _BUILTIN_CONTEXT:
+            known = ", ".join(sorted(_BUILTIN_CONTEXT))
+            raise ValueError(f"unknown context keyword kind {kind!r}; expected one of {known}")
+        if isinstance(keywords, str):
+            keywords = (keywords,)
+        custom = "|".join(_custom_keyword_pattern(k) for k in keywords)
+        alternatives: list[str] = []
+        if mode == "extend":
+            alternatives.append(rf"(?<![A-Za-z])(?:{_BUILTIN_CONTEXT[kind][0]})(?![A-Za-z])")
+        if custom:
+            alternatives.append(rf"(?<!{_UNICODE_LETTER})(?:{custom})(?!{_UNICODE_LETTER})")
+        # An empty "replace" list disables the keyword for that kind.
+        patterns[kind] = re.compile("|".join(alternatives) or r"(?!)", re.IGNORECASE)
+    return patterns
+
+
 def _mask_email(value: str) -> str:
     local, _, domain = value.partition("@")
     return f"{local[:1]}***@{domain}"
@@ -250,6 +297,8 @@ def find_pii(
     require_aadhaar_context: bool = True,
     allow_line_breaks: bool = False,
     allowed_domains: Iterable[str] = (),
+    context_keywords: Mapping[str, Iterable[str]] | None = None,
+    context_mode: ContextMode = "extend",
 ) -> list[Finding]:
     """Find SSNs, ABA routing numbers, Aadhaar/VID, emails, and secrets.
 
@@ -260,9 +309,18 @@ def find_pii(
     ``require_routing_context=False`` or ``require_aadhaar_context=False`` to
     flag on the checksum alone. Set ``allow_line_breaks=True`` to match Aadhaar
     or VID numbers split across a single newline (for PDF or OCR text).
+
+    ``context_keywords`` adds keywords for the context gates, keyed by kind
+    (``"ssn"``, ``"routing_number"``, ``"aadhaar"``; the last also covers VID),
+    for example ``{"ssn": ["numero de seguro social"]}``. With
+    ``context_mode="extend"`` (the default) they are added to the built-in list
+    for that kind; with ``"replace"`` they replace it. Custom keywords match
+    case-insensitively with Unicode letter boundaries, and whitespace inside a
+    keyword also matches ``_``.
     """
     findings: list[Finding] = []
     allowed = frozenset(d.lower().lstrip("@") for d in allowed_domains)
+    contexts = _context_patterns(context_keywords, context_mode)
 
     for match in _SSN_FORMATTED.finditer(text):
         findings.append(Finding("ssn", match.start(), match.end(), f"***-**-{match.group()[-4:]}"))
@@ -270,10 +328,10 @@ def find_pii(
     for match in _NINE_DIGITS.finditer(text):
         digits = match.group()
         context = text[max(0, match.start() - 40) : match.start()]
-        if _SSN_CONTEXT.search(context):
+        if contexts["ssn"].search(context):
             findings.append(Finding("ssn", match.start(), match.end(), f"*****{digits[-4:]}"))
         elif aba_checksum_valid(digits) and (
-            not require_routing_context or _ROUTING_CONTEXT.search(context)
+            not require_routing_context or contexts["routing_number"].search(context)
         ):
             findings.append(
                 Finding("routing_number", match.start(), match.end(), f"*****{digits[-4:]}")
@@ -286,7 +344,7 @@ def find_pii(
         if len(set(digits)) <= 1 or not verhoeff_valid(digits):
             continue
         context = text[max(0, match.start() - 40) : match.start()]
-        if require_aadhaar_context and not _AADHAAR_CONTEXT.search(context):
+        if require_aadhaar_context and not contexts["aadhaar"].search(context):
             continue
         if match.group("vid") is not None:
             findings.append(
@@ -359,6 +417,8 @@ def mask_pii(
     require_aadhaar_context: bool = True,
     allow_line_breaks: bool = False,
     allowed_domains: Iterable[str] = (),
+    context_keywords: Mapping[str, Iterable[str]] | None = None,
+    context_mode: ContextMode = "extend",
 ) -> str:
     """Return ``text`` with every PII finding replaced by its masked form."""
     return _apply_masks(
@@ -371,6 +431,8 @@ def mask_pii(
             require_aadhaar_context=require_aadhaar_context,
             allow_line_breaks=allow_line_breaks,
             allowed_domains=allowed_domains,
+            context_keywords=context_keywords,
+            context_mode=context_mode,
         ),
     )
 
@@ -391,6 +453,8 @@ class NoPII(BaseInvariant):
         allow_line_breaks: bool = False,
         allowed_domains: Iterable[str] = (),
         ignore_keys: Iterable[str] = (),
+        context_keywords: Mapping[str, Iterable[str]] | None = None,
+        context_mode: ContextMode = "extend",
         severity: Severity = Severity.BLOCK,
     ) -> None:
         super().__init__(severity=severity)
@@ -402,6 +466,16 @@ class NoPII(BaseInvariant):
         self.allow_line_breaks = allow_line_breaks
         self.allowed_domains = frozenset(d.lower().lstrip("@") for d in allowed_domains)
         self.ignore_keys = frozenset(ignore_keys)
+        self.context_keywords: dict[str, tuple[str, ...]] | None = (
+            None
+            if context_keywords is None
+            else {
+                kind: (keywords,) if isinstance(keywords, str) else tuple(keywords)
+                for kind, keywords in context_keywords.items()
+            }
+        )
+        self.context_mode: ContextMode = context_mode
+        _context_patterns(self.context_keywords, context_mode)  # validate early
 
     def check(self, trajectory: Trajectory, stage: Stage) -> AssertionResult:
         return self._scan(
@@ -426,6 +500,8 @@ class NoPII(BaseInvariant):
                 require_aadhaar_context=self.require_aadhaar_context,
                 allow_line_breaks=self.allow_line_breaks,
                 allowed_domains=self.allowed_domains,
+                context_keywords=self.context_keywords,
+                context_mode=self.context_mode,
             ):
                 evidence.append(f"{finding.kind} in {location}: {finding.masked}")
                 if span_id:

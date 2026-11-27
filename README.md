@@ -218,6 +218,12 @@ Detection details:
   `aadhar`, `uidai`, `virtual id`, `vid`; bare `uid` is excluded). Use
   `assert_no_pii(require_aadhaar_context=False)` to flag on the checksum alone, and
   `allow_line_breaks=True` for PDF or OCR text where a number wraps across a single newline.
+* **Custom context keywords.** Pass `context_keywords={"ssn": [...], "routing_number": [...],
+  "aadhaar": [...]}` to `find_pii()`, `mask_pii()` or `assert_no_pii()` to add keywords for
+  other languages or company-specific field names (the `aadhaar` list also covers VID). They
+  extend the built-in list by default; use `context_mode="replace"` to replace it for the kinds
+  given. Custom keywords match case-insensitively with Unicode letter boundaries, so keywords in
+  any script work.
 * **Incremental & pre-execution scanning.** When a span opens with an `input`, `Stage.SPAN`
   invariants run before the `with` block executes (blocking tool side effects on violating inputs).
   When the span closes, only its new payloads are scanned. The final pass scans everything once

@@ -609,3 +609,72 @@ def test_aadhaar_labelled_synthetic_corpus():
             assert [f.kind for f in findings] == [expected_kind], sentence
         else:
             assert findings == [], sentence
+
+
+# ---- Custom context keywords ---------------------------------------------------
+
+
+def test_custom_context_keywords_enable_detection_for_each_gated_kind():
+    aadhaar = _with_verhoeff("56789012345")
+    vid = _with_verhoeff("234567890123456")
+    cases = [
+        ("ssn", "numero de seguro social", "Numero de Seguro Social: 123456789", "ssn"),
+        ("routing_number", "bankleitzahl", "Bankleitzahl 011000015", "routing_number"),
+        ("aadhaar", "enrolment no", f"enrolment_no {_group4(aadhaar, ' ')}", "aadhaar"),
+        ("aadhaar", "enrolment no", f"Enrolment No: {vid}", "aadhaar_vid"),
+    ]
+    for kind, keyword, text, expected in cases:
+        assert find_pii(text) == [], text
+        findings = find_pii(text, context_keywords={kind: [keyword]})
+        assert [f.kind for f in findings] == [expected], text
+        assert mask_pii(text, context_keywords={kind: keyword}) != text
+        traj = Trajectory(spans=[tool_span(text)])
+        assert assert_no_pii().evaluate(traj).passed is True
+        res = assert_no_pii(context_keywords={kind: (keyword,)}).evaluate(traj)
+        assert res.passed is False
+        assert all(text not in item for item in res.evidence)
+
+
+def test_custom_context_keywords_extend_by_default_and_replace_on_request():
+    assert [f.kind for f in find_pii("routing 011000015")] == ["routing_number"]
+    extended = find_pii("routing 011000015", context_keywords={"routing_number": ["blz"]})
+    assert [f.kind for f in extended] == ["routing_number"]
+    replaced = {"routing_number": ["blz"]}
+    assert find_pii("routing 011000015", context_keywords=replaced, context_mode="replace") == []
+    blz = find_pii("BLZ 011000015", context_keywords=replaced, context_mode="replace")
+    assert [f.kind for f in blz] == ["routing_number"]
+    # Kinds that are not listed keep their built-in keywords in replace mode.
+    assert [f.kind for f in find_pii("ssn 123456789", context_keywords=replaced)] == ["ssn"]
+    # An empty replacement list turns the gate off for that kind.
+    assert find_pii("ssn 123456789", context_keywords={"ssn": []}, context_mode="replace") == []
+    invariant = assert_no_pii(context_keywords={"ssn": []}, context_mode="replace")
+    assert invariant.evaluate(Trajectory(spans=[tool_span("ssn 123456789")])).passed is True
+
+
+def test_non_latin_custom_context_keywords_match_with_unicode_boundaries():
+    aadhaar = _with_verhoeff("67890123456")
+    keywords = {"aadhaar": ["आधार संख्या"], "ssn": ["СНИЛС"]}
+    hindi = f"ग्राहक आधार संख्या: {aadhaar}"
+    assert find_pii(hindi) == []
+    assert [f.kind for f in find_pii(hindi, context_keywords=keywords)] == ["aadhaar"]
+    # Case-insensitive in any script, and "_" or digits count as boundaries.
+    for text in ("снилс 123456789", "снилс_номер 123456789"):
+        assert [f.kind for f in find_pii(text, context_keywords=keywords)] == ["ssn"], text
+    # A keyword inside a longer word in the same script does not count.
+    assert find_pii("ПСНИЛСА 123456789", context_keywords=keywords) == []
+    assert find_pii("seguridad 123456789", context_keywords={"ssn": ["dad"]}) == []
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"context_keywords": {"email": ["mail"]}},
+        {"context_keywords": {"ssn": ["  "]}},
+        {"context_keywords": {"ssn": ["sv"]}, "context_mode": "merge"},
+    ],
+)
+def test_invalid_context_keywords_rejected(kwargs):
+    with pytest.raises(ValueError):
+        find_pii("ssn 123456789", **kwargs)
+    with pytest.raises(ValueError):
+        assert_no_pii(**kwargs)
